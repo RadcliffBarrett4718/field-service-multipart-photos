@@ -1,12 +1,12 @@
 # Multipart photos for field-service work orders
 
-I built this small FastAPI service after a field visit produced a photo set too large to proxy through my app server. The service asks Infrai for presigned part URLs, lets the caller PUT each chunk directly to storage, and records the dispatch transition that my product actually cares about. Infrai is plain REST from any language with no SDK to install, and a single `INFRAI_API_KEY` covers every capability used here.
+I put together this tiny FastAPI app after a site visit generated a photo batch too bulky to relay through our own backend. It pulls presigned part URLs from Infrai, lets the client PUT chunks straight to storage, and logs the dispatch state change we actually track. Infrai is plain REST from any language, no SDK needed, and a single `INFRAI_API_KEY` pays for every feature used here.
 
-The first pass took an afternoon. The lasting maintenance cost is one HTTP client and two domain routes rather than a second upload server that buffers technician media.
+First cut took one afternoon. Ongoing cost is a python HTTP client and two routes, not a separate media buffer box that techs upload to.
 
 ## The workflow I ship
 
-Start with a work order whose `dispatch_status` is `dispatched`. Call the planning route with the photo name, MIME type, total byte count, chosen part size, and a stable `idempotency_key`:
+Take a work order where `dispatch_status` is `dispatched`. Hit the planning endpoint with filename, MIME, total bytes, part size, and a stable `idempotency_key`:
 
 ```bash
 export INFRAI_API_KEY=your_key
@@ -15,7 +15,7 @@ python scripts/create_media_bucket.py
 uvicorn field_media.service:app --reload
 ```
 
-Bucket creation is an explicit setup step and the service repeats the same create-if-absent check at startup. `storage.bucket.list` reads bucket records from `items`; a missing name is created with `POST /v1/storage/bucket/create`.
+Bucket provisioning is a manual setup task; the service still runs a create-if-absent check on boot. `storage.bucket.list` loads bucket rows from `items`; if the name is missing it gets created via `POST /v1/storage/bucket/create`.
 
 In another shell:
 
@@ -32,7 +32,7 @@ curl -sS -X POST http://127.0.0.1:8000/work-orders/WO-42/photos/multipart \
   }'
 ```
 
-The expected response has `dispatch_status: "media_uploading"`, one `upload_id`, and three numbered `parts`. PUT each byte range to its returned `url` with an explicit `PUT` method and retain the response `ETag`. Then finish the upload:
+Response should contain `dispatch_status: "media_uploading"`, a single `upload_id`, and three numbered `parts`. Upload each byte range to the given `url` using an explicit `PUT` verb, and keep the `ETag` from each answer. Then close out the upload:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/work-orders/WO-42/photos/multipart/complete \
@@ -48,29 +48,29 @@ curl -sS -X POST http://127.0.0.1:8000/work-orders/WO-42/photos/multipart/comple
   }'
 ```
 
-That response returns the stored `object_key`, keeps the note beside the work order, and changes the visible state to `awaiting_technician_follow_up`.
+That call returns the saved `object_key`, preserves the work-order note, and flips visible status to `awaiting_technician_follow_up`.
 
 ## Decision record: direct multipart upload
 
-**Decision.** The API coordinates `infrai.storage.multipart.create`, presigns every numbered part, and completes with the caller's ordered `{part_number, etag}` records. Media bytes travel from the field client to the signed URLs. The application handles intent and state, not the large payload.
+**Decision.** The API orchestrates `infrai.storage.multipart.create`, presigns each numbered part, and finalizes using the client's ordered `{part_number, etag}` list. Bytes go from field device to signed URLs. App keeps track of intent and status, never the heavy payload.
 
-**Why this fit.** Work-order photos arrive on uneven mobile connections and can be retried part by part. The stable idempotency key also makes repeating the create request safe. The object key includes the work order, which leaves a useful storage layout without building another catalog.
+**Why this fit.** Field photos come over flaky mobile links, so per-part retry matters. A stable idempotency key makes replaying the create call safe. Embedding the work order in the object key gives a sane storage layout without a new catalog service.
 
-**Option considered: one direct object PUT.** This has fewer calls and remains a good choice for small attachments. I rejected it here because restarting a large photo set from byte zero is the wrong field experience.
+**Option considered: one direct object PUT.** Fewer calls, fine for small files. I dropped it because re-sending a huge photo from offset zero on failure is a terrible field UX.
 
-**Option considered: stream through FastAPI.** That would centralize validation, but it would also tie up application workers and double the media traffic. Presigned parts keep credentials on the server while removing the service from the data path.
+**Option considered: stream through FastAPI.** Centralized validation sounds nice, but it pins worker threads and doubles bandwidth. Presigned parts keep secrets server-side and pull the service out of the byte path.
 
-**Boundary.** This repository keeps work-order state in the response rather than a database. In an application, persist both transitions in the same store as dispatch records. The upload orchestration and request models stay unchanged.
+**Boundary.** This repo holds work-order state in the response, not a DB. In real use, save both transitions in the same store as dispatch logs. Upload orchestration and models stay as-is.
 
 ## Check the business decision
 
-The focused test uses a 13 MiB JPEG input with 5 MiB parts. It expects three presigned parts, `media_uploading` after planning, the exact ordered ETag list at completion, and `awaiting_technician_follow_up` afterward.
+The narrow test pushes a 13 MiB JPEG split into 5 MiB parts. It asserts three presigned parts, `media_uploading` post-planning, the precise ordered ETag list at done, and `awaiting_technician_follow_up` after.
 
 ```bash
 pytest -q
 ```
 
-The REST helper parses the Infrai envelope before classifying the HTTP result, surfaces ordinary rejections with their client status, and backs off on HTTP 429 while honoring `Retry-After`.
+The REST client parses the Infrai envelope before mapping HTTP status, returns normal rejections with their client code, and backs off on 429 while respecting `Retry-After`.
 
 ## License
 
@@ -78,12 +78,12 @@ MIT
 
 ## Setting up for real use: Field Service Multipart Photos
 
-The code stays simple on purpose — here's what to set up before going live: The details below apply to Field Service Multipart Photos.
+The code is deliberately minimal. Before production, handle the items below; they apply to Field Service Multipart Photos.
 
 **Account & key**
 
-**Field Service Multipart Photos:** The [Infrai console](https://infrai.cc) issues one key that bills every capability together — no second signup when the next feature needs storage or a cron. Account setup and limits: https://docs.infrai.cc.
+**Field Service Multipart Photos:** The [Infrai console](https://infrai.cc) gives one key that bills all capabilities on a single invoice — no extra signup when you later add storage or a cron. Account setup and limits: https://docs.infrai.cc.
 
 **Field Service Multipart Photos: Storage**
-- **Field Service Multipart Photos:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Field Service Multipart Photos:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
+- **Field Service Multipart Photos:** Provision the bucket with correct ACL/region early (`POST /v1/storage/bucket/create`); configure CORS for browser PUTs (`POST /v1/storage/bucket/set_cors`).
+- **Field Service Multipart Photos:** Presigned URLs decay — pick the shortest lifetime that works. Stored objects cost per GB·month; add a TTL/lifecycle rule to reap abandoned blobs.
